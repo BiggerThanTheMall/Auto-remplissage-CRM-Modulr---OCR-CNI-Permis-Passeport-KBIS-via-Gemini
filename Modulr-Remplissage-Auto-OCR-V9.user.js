@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Remplissage Automatique V9 - OCR Documents
 // @namespace    https://github.com/BiggerThanTheMall/tampermonkey-ltoa
-// @version      9.2.0
+// @version      9.2.1
 // @description  Auto-remplissage CRM Modulr - OCR CNI/Permis/Passeport/KBIS via Gemini
 // @author       Sheana
 // @match        https://courtage.modulr.fr/fr/scripts/clients/clients_manage.php*
@@ -188,20 +188,28 @@
                 const errorBody = await response.text();
                 console.error('[API] Erreur:', response.status, errorBody);
 
-                // Si modèle non trouvé (404) ou erreur serveur, essayer un autre modèle
-                if ((response.status === 404 || response.status === 503) && retryCount < 3) {
+                // Rate limit (429) - NE PAS retry, attendre
+                if (response.status === 429) {
+                    throw new Error('⏳ Trop de requêtes ! Attendez 1 minute avant de réessayer.');
+                }
+
+                // Si modèle non trouvé (404) ou erreur serveur (503), essayer un autre modèle
+                if ((response.status === 404 || response.status === 503) && retryCount < 2) {
                     console.log('[API] Modèle indisponible, recherche alternative...');
                     showMessage('🔄 Modèle indisponible, recherche alternative...', 'info', 3000);
 
                     // Invalider le cache
                     GM_deleteValue('gemini_model_cache');
 
+                    // Attendre un peu avant de retry
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+
                     // Chercher un autre modèle
                     await detectBestModel();
                     return callGeminiAPI(contents, retryCount + 1);
                 }
 
-                throw new Error(`Erreur ${response.status}: ${errorBody}`);
+                throw new Error(`Erreur ${response.status}`);
             }
 
             // Sauvegarder le modèle qui fonctionne
@@ -210,10 +218,14 @@
             return await response.json();
 
         } catch (err) {
-            if (retryCount < 3) {
-                console.log('[API] Erreur, tentative avec autre modèle...');
-                GM_deleteValue('gemini_model_cache');
-                await detectBestModel();
+            // Ne pas retry sur rate limit ou si message d'erreur personnalisé
+            if (err.message.includes('Trop de requêtes') || err.message.includes('429')) {
+                throw err;
+            }
+            
+            if (retryCount < 2 && !err.message.includes('Erreur')) {
+                console.log('[API] Erreur réseau, nouvelle tentative...');
+                await new Promise(resolve => setTimeout(resolve, 1000));
                 return callGeminiAPI(contents, retryCount + 1);
             }
             throw err;
@@ -925,7 +937,7 @@ JSON uniquement:
             <div class="ai-header">
                 <button class="ai-minimize">−</button>
                 <h2 class="ai-title">Remplissage Auto</h2>
-                <p class="ai-subtitle">IA + OCR Documents · V9.2 (Auto-Model)</p>
+                <p class="ai-subtitle">IA + OCR Documents · V9.2.1 (Auto-Model)</p>
                 <div class="ai-status">
                     <span class="ai-status-dot"></span>
                     Connecté
