@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Remplissage Automatique V9 - OCR Documents
 // @namespace    https://github.com/BiggerThanTheMall/tampermonkey-ltoa
-// @version      9.1.0
+// @version      9.2.0
 // @description  Auto-remplissage CRM Modulr - OCR CNI/Permis/Passeport/KBIS via Gemini
 // @author       Sheana
 // @match        https://courtage.modulr.fr/fr/scripts/clients/clients_manage.php*
@@ -21,10 +21,18 @@
     // CONFIGURATION
     // ============================================
     const CONFIG = {
-        MODEL: 'gemini-2.5-flash',
         API_ENDPOINT: 'https://generativelanguage.googleapis.com/v1beta/models/',
         MAX_TOKENS: 4096,
         TEMPERATURE: 0,
+        // Priorité des modèles Flash (du plus récent au plus ancien)
+        MODEL_PRIORITY: [
+            'gemini-2.5-flash',
+            'gemini-2.0-flash',
+            'gemini-1.5-flash',
+            'gemini-flash'
+        ],
+        // Cache du modèle (24h en ms)
+        MODEL_CACHE_DURATION: 24 * 60 * 60 * 1000,
         // Types de fichiers supportés
         SUPPORTED_TYPES: {
             'application/pdf': 'PDF',
@@ -49,6 +57,166 @@
         } else {
             alert('❌ Clé API requise');
             return;
+        }
+    }
+
+    // ============================================
+    // DÉTECTION AUTOMATIQUE DU MODÈLE
+    // ============================================
+    let currentModel = null;
+
+    async function detectBestModel() {
+        // Vérifier le cache
+        const cached = GM_getValue('gemini_model_cache');
+        if (cached) {
+            const { model, timestamp } = JSON.parse(cached);
+            if (Date.now() - timestamp < CONFIG.MODEL_CACHE_DURATION) {
+                console.log('[Model] Utilisation du cache:', model);
+                currentModel = model;
+                return model;
+            }
+        }
+
+        console.log('[Model] Détection du meilleur modèle...');
+        showMessage('🔍 Détection du modèle...', 'info', 3000);
+
+        try {
+            // Récupérer la liste des modèles disponibles
+            const response = await fetch(
+                `https://generativelanguage.googleapis.com/v1beta/models?key=${API_KEY}`
+            );
+
+            if (!response.ok) {
+                throw new Error(`Erreur API: ${response.status}`);
+            }
+
+            const data = await response.json();
+            const availableModels = data.models || [];
+
+            console.log('[Model] Modèles disponibles:', availableModels.map(m => m.name));
+
+            // Filtrer les modèles Flash qui supportent generateContent
+            const flashModels = availableModels.filter(m => {
+                const name = m.name.replace('models/', '');
+                const isFlash = name.includes('flash');
+                const supportsGenerate = m.supportedGenerationMethods?.includes('generateContent');
+                return isFlash && supportsGenerate;
+            });
+
+            console.log('[Model] Modèles Flash disponibles:', flashModels.map(m => m.name));
+
+            // Trouver le meilleur modèle selon notre priorité
+            for (const priority of CONFIG.MODEL_PRIORITY) {
+                const match = flashModels.find(m => {
+                    const name = m.name.replace('models/', '');
+                    return name.startsWith(priority) || name === priority;
+                });
+                if (match) {
+                    const modelName = match.name.replace('models/', '');
+                    console.log('[Model] Meilleur modèle trouvé:', modelName);
+
+                    // Sauvegarder dans le cache
+                    GM_setValue('gemini_model_cache', JSON.stringify({
+                        model: modelName,
+                        timestamp: Date.now()
+                    }));
+
+                    currentModel = modelName;
+                    return modelName;
+                }
+            }
+
+            // Fallback: prendre le premier modèle Flash disponible
+            if (flashModels.length > 0) {
+                const fallback = flashModels[0].name.replace('models/', '');
+                console.log('[Model] Fallback sur:', fallback);
+                currentModel = fallback;
+                return fallback;
+            }
+
+            throw new Error('Aucun modèle Flash disponible');
+
+        } catch (err) {
+            console.error('[Model] Erreur détection:', err);
+            // Fallback sur le dernier modèle connu ou par défaut
+            const lastKnown = GM_getValue('gemini_last_working_model') || 'gemini-2.0-flash';
+            console.log('[Model] Utilisation du fallback:', lastKnown);
+            currentModel = lastKnown;
+            return lastKnown;
+        }
+    }
+
+    // Tester si un modèle fonctionne
+    async function testModel(modelName) {
+        try {
+            const response = await fetch(`${CONFIG.API_ENDPOINT}${modelName}:generateContent?key=${API_KEY}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    contents: [{ role: "user", parts: [{ text: "OK" }] }],
+                    generationConfig: { maxOutputTokens: 5 }
+                })
+            });
+            return response.ok;
+        } catch {
+            return false;
+        }
+    }
+
+    // Appel API avec retry automatique sur autre modèle
+    async function callGeminiAPI(contents, retryCount = 0) {
+        if (!currentModel) {
+            await detectBestModel();
+        }
+
+        const apiUrl = `${CONFIG.API_ENDPOINT}${currentModel}:generateContent?key=${API_KEY}`;
+
+        try {
+            const response = await fetch(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    contents: contents,
+                    generationConfig: {
+                        maxOutputTokens: CONFIG.MAX_TOKENS,
+                        temperature: CONFIG.TEMPERATURE
+                    }
+                })
+            });
+
+            if (!response.ok) {
+                const errorBody = await response.text();
+                console.error('[API] Erreur:', response.status, errorBody);
+
+                // Si modèle non trouvé (404) ou erreur serveur, essayer un autre modèle
+                if ((response.status === 404 || response.status === 503) && retryCount < 3) {
+                    console.log('[API] Modèle indisponible, recherche alternative...');
+                    showMessage('🔄 Modèle indisponible, recherche alternative...', 'info', 3000);
+
+                    // Invalider le cache
+                    GM_deleteValue('gemini_model_cache');
+
+                    // Chercher un autre modèle
+                    await detectBestModel();
+                    return callGeminiAPI(contents, retryCount + 1);
+                }
+
+                throw new Error(`Erreur ${response.status}: ${errorBody}`);
+            }
+
+            // Sauvegarder le modèle qui fonctionne
+            GM_setValue('gemini_last_working_model', currentModel);
+
+            return await response.json();
+
+        } catch (err) {
+            if (retryCount < 3) {
+                console.log('[API] Erreur, tentative avec autre modèle...');
+                GM_deleteValue('gemini_model_cache');
+                await detectBestModel();
+                return callGeminiAPI(contents, retryCount + 1);
+            }
+            throw err;
         }
     }
 
@@ -111,7 +279,6 @@
         return new Promise((resolve, reject) => {
             const reader = new FileReader();
             reader.onload = () => {
-                // Retirer le préfixe "data:...;base64,"
                 const base64 = reader.result.split(',')[1];
                 resolve(base64);
             };
@@ -294,7 +461,6 @@
     // PARSING JSON ROBUSTE
     // ============================================
     function parseJsonRobust(jsonText) {
-        // Nettoyage
         jsonText = jsonText.replace(/^```json\s*/g, '').replace(/^```\s*/g, '').replace(/\s*```$/g, '');
         const firstBrace = jsonText.indexOf('{');
         const lastBrace = jsonText.lastIndexOf('}');
@@ -306,7 +472,6 @@
             return JSON.parse(jsonText);
         } catch (e) {
             console.warn('[IA] JSON tronqué, extraction manuelle...');
-            // Extraction par regex
             return {
                 clientType: (jsonText.match(/"clientType"\s*:\s*"([^"]*)"/) || [])[1] || 'Individual',
                 civility: (jsonText.match(/"civility"\s*:\s*"([^"]*)"/) || [])[1] || '',
@@ -395,7 +560,6 @@ Identifie le type de document (CNI, permis, passeport, KBIS, facture, courrier..
     async function extractFromFile(file, docType = 'auto') {
         console.log('[OCR] Fichier:', file.name, file.type, file.size);
 
-        // Vérifications
         if (!CONFIG.SUPPORTED_TYPES[file.type]) {
             showMessage(`❌ Type non supporté: ${file.type}`, 'error');
             return;
@@ -417,48 +581,24 @@ Identifie le type de document (CNI, permis, passeport, KBIS, facture, courrier..
 JSON attendu:
 {"clientType":"","civility":"","firstName":"","lastName":"","email":"","email2":"","mobilePhoneNumber":"","professionalPhoneNumber":"","streetAddress":"","streetAddress2":"","zipCode":"","city":"","country":"FRANCE","jobTitle":"","organization":"","businessName":"","birthDate":"","birthName":"","siret":"","website":""}`;
 
-            const apiUrl = `${CONFIG.API_ENDPOINT}${CONFIG.MODEL}:generateContent?key=${API_KEY}`;
-
-            // Déterminer le mimeType correct
             let mimeType = file.type;
             if (mimeType === 'image/jpg') mimeType = 'image/jpeg';
 
-            const requestBody = {
-                contents: [{
-                    role: "user",
-                    parts: [
-                        {
-                            inline_data: {
-                                mime_type: mimeType,
-                                data: base64Data
-                            }
-                        },
-                        { text: prompt }
-                    ]
-                }],
-                generationConfig: {
-                    maxOutputTokens: CONFIG.MAX_TOKENS,
-                    temperature: CONFIG.TEMPERATURE
-                }
-            };
+            const contents = [{
+                role: "user",
+                parts: [
+                    {
+                        inline_data: {
+                            mime_type: mimeType,
+                            data: base64Data
+                        }
+                    },
+                    { text: prompt }
+                ]
+            }];
 
-            console.log('[OCR] Envoi à Gemini...');
-            const response = await fetch(apiUrl, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(requestBody)
-            });
-
-            if (!response.ok) {
-                const errorBody = await response.text();
-                console.error('[OCR] Erreur HTTP:', response.status, errorBody);
-                if (response.status === 400) throw new Error('Fichier non lisible par Gemini');
-                if (response.status === 413) throw new Error('Fichier trop volumineux');
-                throw new Error(`Erreur ${response.status}`);
-            }
-
-            const result = await response.json();
-            console.log('[OCR] Réponse:', result);
+            console.log('[OCR] Envoi à Gemini (modèle:', currentModel || 'auto-detect', ')...');
+            const result = await callGeminiAPI(contents);
 
             if (!result.candidates?.[0]?.content?.parts?.[0]?.text) {
                 if (result.promptFeedback?.blockReason) {
@@ -473,11 +613,10 @@ JSON attendu:
             const data = parseJsonRobust(jsonText);
             console.log('[OCR] Données extraites:', data);
 
-            // Corrections automatiques
             if (!data.country) data.country = 'FRANCE';
 
             fillCrmFields(data);
-            showMessage('✅ Document analysé !', 'success');
+            showMessage(`✅ Document analysé ! (${currentModel})`, 'success');
 
         } catch (err) {
             console.error('[OCR] Erreur:', err);
@@ -512,19 +651,10 @@ Texte: ${text}
 JSON uniquement:
 {"clientType":"","civility":"","firstName":"","lastName":"","email":"","email2":"","mobilePhoneNumber":"","professionalPhoneNumber":"","streetAddress":"","streetAddress2":"","zipCode":"","city":"","country":"FRANCE","jobTitle":"","organization":"","businessName":"","birthDate":"","birthName":"","siret":"","website":""}`;
 
-            const apiUrl = `${CONFIG.API_ENDPOINT}${CONFIG.MODEL}:generateContent?key=${API_KEY}`;
-            const response = await fetch(apiUrl, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    contents: [{ role: "user", parts: [{ text: prompt }] }],
-                    generationConfig: { maxOutputTokens: CONFIG.MAX_TOKENS, temperature: CONFIG.TEMPERATURE }
-                })
-            });
+            const contents = [{ role: "user", parts: [{ text: prompt }] }];
 
-            if (!response.ok) throw new Error(`Erreur ${response.status}`);
+            const result = await callGeminiAPI(contents);
 
-            const result = await response.json();
             if (!result.candidates?.[0]?.content?.parts?.[0]?.text) {
                 throw new Error('Réponse vide');
             }
@@ -532,14 +662,13 @@ JSON uniquement:
             const data = parseJsonRobust(result.candidates[0].content.parts[0].text);
             if (!data.country) data.country = 'FRANCE';
 
-            // Backup SIRET
             if (!data.siret) {
                 const siretMatch = text.match(/\b\d{14}\b/);
                 if (siretMatch) data.siret = siretMatch[0];
             }
 
             fillCrmFields(data);
-            showMessage('✅ Extraction réussie !', 'success');
+            showMessage(`✅ Extraction réussie ! (${currentModel})`, 'success');
 
         } catch (err) {
             console.error('[IA] Erreur:', err);
@@ -564,21 +693,32 @@ JSON uniquement:
     async function testApi() {
         showMessage("🔍 Test connexion...", 'info');
         try {
-            const response = await fetch(`${CONFIG.API_ENDPOINT}${CONFIG.MODEL}:generateContent?key=${API_KEY}`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    contents: [{ role: "user", parts: [{ text: "Réponds OK" }] }],
-                    generationConfig: { maxOutputTokens: 10 }
-                })
-            });
-            if (response.ok) {
-                showMessage(`✅ API OK ! Modèle: ${CONFIG.MODEL}`, 'success');
+            await detectBestModel();
+            const result = await callGeminiAPI([{ role: "user", parts: [{ text: "Réponds OK" }] }]);
+            if (result.candidates) {
+                showMessage(`✅ API OK ! Modèle: ${currentModel}`, 'success');
             } else {
-                showMessage(`❌ Erreur ${response.status}`, 'error');
+                showMessage(`❌ Réponse invalide`, 'error');
             }
         } catch (err) {
             showMessage(`❌ ${err.message}`, 'error');
+        }
+    }
+
+    // Forcer la re-détection du modèle
+    async function refreshModel() {
+        GM_deleteValue('gemini_model_cache');
+        currentModel = null;
+        showMessage("🔄 Rafraîchissement du modèle...", 'info');
+        await detectBestModel();
+        showMessage(`✅ Modèle actuel: ${currentModel}`, 'success');
+        updateModelDisplay();
+    }
+
+    function updateModelDisplay() {
+        const modelInfo = document.querySelector('.ai-model-info');
+        if (modelInfo) {
+            modelInfo.textContent = `Modèle: ${currentModel || 'auto-detect'}`;
         }
     }
 
@@ -745,20 +885,24 @@ JSON uniquement:
             }
 
             .ai-btn-secondary {
-                width: 100%; padding: 12px; border: none; border-radius: 12px;
+                flex: 1; padding: 12px; border: none; border-radius: 12px;
                 background: rgba(0,0,0,0.04); color: rgba(0,0,0,0.6);
-                font-size: 13px; cursor: pointer; margin-bottom: 8px;
+                font-size: 13px; cursor: pointer;
             }
             .ai-btn-secondary:hover { background: rgba(0,0,0,0.08); }
 
             .ai-footer {
                 display: flex; gap: 8px; margin-top: 8px;
             }
-            .ai-footer button { flex: 1; }
 
             .ai-model-info {
                 font-size: 11px; color: rgba(0,0,0,0.35);
                 text-align: center; margin-top: 12px;
+                cursor: pointer;
+            }
+            .ai-model-info:hover {
+                color: rgba(0,0,0,0.6);
+                text-decoration: underline;
             }
 
             .ai-fab {
@@ -781,7 +925,7 @@ JSON uniquement:
             <div class="ai-header">
                 <button class="ai-minimize">−</button>
                 <h2 class="ai-title">Remplissage Auto</h2>
-                <p class="ai-subtitle">IA + OCR Documents · V9.1</p>
+                <p class="ai-subtitle">IA + OCR Documents · V9.2 (Auto-Model)</p>
                 <div class="ai-status">
                     <span class="ai-status-dot"></span>
                     Connecté
@@ -830,10 +974,11 @@ JSON uniquement:
                 </div>
 
                 <div class="ai-footer">
-                    <button id="test-api" class="ai-btn-secondary">🔍 Test API</button>
-                    <button id="reset-key" class="ai-btn-secondary">🔑 Clé API</button>
+                    <button id="test-api" class="ai-btn-secondary">🔍 Test</button>
+                    <button id="refresh-model" class="ai-btn-secondary">🔄 Modèle</button>
+                    <button id="reset-key" class="ai-btn-secondary">🔑 Clé</button>
                 </div>
-                <p class="ai-model-info">Modèle: ${CONFIG.MODEL}</p>
+                <p class="ai-model-info" title="Cliquez pour rafraîchir">Modèle: auto-detect</p>
             </div>
         `;
         document.body.prepend(container);
@@ -922,12 +1067,21 @@ JSON uniquement:
 
         // Utilities
         document.getElementById('test-api').onclick = testApi;
+        document.getElementById('refresh-model').onclick = refreshModel;
         document.getElementById('reset-key').onclick = () => {
             if (confirm('Supprimer la clé API ?')) {
                 GM_deleteValue('gemini_api_key');
+                GM_deleteValue('gemini_model_cache');
+                GM_deleteValue('gemini_last_working_model');
                 location.reload();
             }
         };
+
+        // Clic sur le modèle pour rafraîchir
+        document.querySelector('.ai-model-info').onclick = refreshModel;
+
+        // Détecter le modèle au démarrage
+        detectBestModel().then(updateModelDisplay);
     }
 
     window.addEventListener('load', initUI);
