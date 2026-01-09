@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Remplissage Automatique V9 - OCR Documents
 // @namespace    https://github.com/BiggerThanTheMall/tampermonkey-ltoa
-// @version      9.2.1
+// @version      9.2.3
 // @description  Auto-remplissage CRM Modulr - OCR CNI/Permis/Passeport/KBIS via Gemini
 // @author       Sheana
 // @match        https://courtage.modulr.fr/fr/scripts/clients/clients_manage.php*
@@ -31,8 +31,10 @@
             'gemini-1.5-flash',
             'gemini-flash'
         ],
-        // Cache du modèle (24h en ms)
-        MODEL_CACHE_DURATION: 24 * 60 * 60 * 1000,
+        // Modèle par défaut si aucun cache
+        DEFAULT_MODEL: 'gemini-2.0-flash',
+        // Cache du modèle (7 jours)
+        MODEL_CACHE_DURATION: 7 * 24 * 60 * 60 * 1000,
         // Types de fichiers supportés
         SUPPORTED_TYPES: {
             'application/pdf': 'PDF',
@@ -61,34 +63,39 @@
     }
 
     // ============================================
-    // DÉTECTION AUTOMATIQUE DU MODÈLE
+    // GESTION DU MODÈLE
     // ============================================
     let currentModel = null;
 
-    async function detectBestModel() {
-        // Vérifier le cache
+    // Charge le modèle depuis le cache SANS appel API (instantané)
+    function loadModelFromCache() {
         const cached = GM_getValue('gemini_model_cache');
         if (cached) {
-            const { model, timestamp } = JSON.parse(cached);
-            if (Date.now() - timestamp < CONFIG.MODEL_CACHE_DURATION) {
-                console.log('[Model] Utilisation du cache:', model);
-                currentModel = model;
-                return model;
-            }
+            try {
+                const { model, timestamp } = JSON.parse(cached);
+                if (Date.now() - timestamp < CONFIG.MODEL_CACHE_DURATION) {
+                    currentModel = model;
+                    console.log('[Model] Cache:', model);
+                    return model;
+                }
+            } catch (e) {}
         }
+        // Fallback sur le dernier modèle qui a fonctionné ou le défaut
+        currentModel = GM_getValue('gemini_last_working_model') || CONFIG.DEFAULT_MODEL;
+        console.log('[Model] Fallback:', currentModel);
+        return currentModel;
+    }
 
-        console.log('[Model] Détection du meilleur modèle...');
-        showMessage('🔍 Détection du modèle...', 'info', 3000);
+    // Détection complète (appelée SEULEMENT si erreur 404 ou clic manuel)
+    async function detectBestModel(showNotification = true) {
+        if (showNotification) showMessage('🔍 Recherche du meilleur modèle...', 'info', 3000);
 
         try {
-            // Récupérer la liste des modèles disponibles
             const response = await fetch(
                 `https://generativelanguage.googleapis.com/v1beta/models?key=${API_KEY}`
             );
 
-            if (!response.ok) {
-                throw new Error(`Erreur API: ${response.status}`);
-            }
+            if (!response.ok) throw new Error(`Erreur API: ${response.status}`);
 
             const data = await response.json();
             const availableModels = data.models || [];
@@ -114,14 +121,8 @@
                 if (match) {
                     const modelName = match.name.replace('models/', '');
                     console.log('[Model] Meilleur modèle trouvé:', modelName);
-
-                    // Sauvegarder dans le cache
-                    GM_setValue('gemini_model_cache', JSON.stringify({
-                        model: modelName,
-                        timestamp: Date.now()
-                    }));
-
-                    currentModel = modelName;
+                    saveModelToCache(modelName);
+                    if (showNotification) showMessage(`✅ Modèle: ${modelName}`, 'success');
                     return modelName;
                 }
             }
@@ -130,7 +131,8 @@
             if (flashModels.length > 0) {
                 const fallback = flashModels[0].name.replace('models/', '');
                 console.log('[Model] Fallback sur:', fallback);
-                currentModel = fallback;
+                saveModelToCache(fallback);
+                if (showNotification) showMessage(`✅ Modèle: ${fallback}`, 'success');
                 return fallback;
             }
 
@@ -138,37 +140,25 @@
 
         } catch (err) {
             console.error('[Model] Erreur détection:', err);
-            // Fallback sur le dernier modèle connu ou par défaut
-            const lastKnown = GM_getValue('gemini_last_working_model') || 'gemini-2.0-flash';
-            console.log('[Model] Utilisation du fallback:', lastKnown);
-            currentModel = lastKnown;
-            return lastKnown;
+            if (showNotification) showMessage(`⚠️ Utilisation de ${currentModel}`, 'info');
+            return currentModel;
         }
     }
 
-    // Tester si un modèle fonctionne
-    async function testModel(modelName) {
-        try {
-            const response = await fetch(`${CONFIG.API_ENDPOINT}${modelName}:generateContent?key=${API_KEY}`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    contents: [{ role: "user", parts: [{ text: "OK" }] }],
-                    generationConfig: { maxOutputTokens: 5 }
-                })
-            });
-            return response.ok;
-        } catch {
-            return false;
-        }
+    function saveModelToCache(model) {
+        currentModel = model;
+        GM_setValue('gemini_model_cache', JSON.stringify({
+            model: model,
+            timestamp: Date.now()
+        }));
+        GM_setValue('gemini_last_working_model', model);
+        updateModelDisplay();
     }
 
-    // Appel API avec retry automatique sur autre modèle
+    // ============================================
+    // APPEL API GEMINI
+    // ============================================
     async function callGeminiAPI(contents, retryCount = 0) {
-        if (!currentModel) {
-            await detectBestModel();
-        }
-
         const apiUrl = `${CONFIG.API_ENDPOINT}${currentModel}:generateContent?key=${API_KEY}`;
 
         try {
@@ -188,24 +178,24 @@
                 const errorBody = await response.text();
                 console.error('[API] Erreur:', response.status, errorBody);
 
-                // Rate limit (429) - NE PAS retry, attendre
+                // Rate limit (429) - NE PAS retry
                 if (response.status === 429) {
                     throw new Error('⏳ Trop de requêtes ! Attendez 1 minute avant de réessayer.');
                 }
 
-                // Si modèle non trouvé (404) ou erreur serveur (503), essayer un autre modèle
-                if ((response.status === 404 || response.status === 503) && retryCount < 2) {
-                    console.log('[API] Modèle indisponible, recherche alternative...');
-                    showMessage('🔄 Modèle indisponible, recherche alternative...', 'info', 3000);
-
-                    // Invalider le cache
+                // Si modèle non trouvé (404) → re-détecter automatiquement
+                if (response.status === 404 && retryCount < 1) {
+                    console.log('[API] Modèle 404, re-détection...');
+                    showMessage('🔄 Modèle obsolète, mise à jour...', 'info', 3000);
                     GM_deleteValue('gemini_model_cache');
+                    await detectBestModel(false);
+                    return callGeminiAPI(contents, retryCount + 1);
+                }
 
-                    // Attendre un peu avant de retry
+                // Erreur serveur (503) → retry avec même modèle
+                if (response.status === 503 && retryCount < 2) {
+                    console.log('[API] Erreur 503, retry...');
                     await new Promise(resolve => setTimeout(resolve, 1000));
-
-                    // Chercher un autre modèle
-                    await detectBestModel();
                     return callGeminiAPI(contents, retryCount + 1);
                 }
 
@@ -218,7 +208,7 @@
             return await response.json();
 
         } catch (err) {
-            // Ne pas retry sur rate limit ou si message d'erreur personnalisé
+            // Ne pas retry sur rate limit
             if (err.message.includes('Trop de requêtes') || err.message.includes('429')) {
                 throw err;
             }
@@ -609,7 +599,7 @@ JSON attendu:
                 ]
             }];
 
-            console.log('[OCR] Envoi à Gemini (modèle:', currentModel || 'auto-detect', ')...');
+            console.log('[OCR] Envoi à Gemini (modèle:', currentModel, ')...');
             const result = await callGeminiAPI(contents);
 
             if (!result.candidates?.[0]?.content?.parts?.[0]?.text) {
@@ -628,7 +618,7 @@ JSON attendu:
             if (!data.country) data.country = 'FRANCE';
 
             fillCrmFields(data);
-            showMessage(`✅ Document analysé ! (${currentModel})`, 'success');
+            showMessage(`✅ Document analysé !`, 'success');
 
         } catch (err) {
             console.error('[OCR] Erreur:', err);
@@ -680,7 +670,7 @@ JSON uniquement:
             }
 
             fillCrmFields(data);
-            showMessage(`✅ Extraction réussie ! (${currentModel})`, 'success');
+            showMessage(`✅ Extraction réussie !`, 'success');
 
         } catch (err) {
             console.error('[IA] Erreur:', err);
@@ -705,7 +695,6 @@ JSON uniquement:
     async function testApi() {
         showMessage("🔍 Test connexion...", 'info');
         try {
-            await detectBestModel();
             const result = await callGeminiAPI([{ role: "user", parts: [{ text: "Réponds OK" }] }]);
             if (result.candidates) {
                 showMessage(`✅ API OK ! Modèle: ${currentModel}`, 'success');
@@ -717,20 +706,17 @@ JSON uniquement:
         }
     }
 
-    // Forcer la re-détection du modèle
+    // Forcer la re-détection du modèle (clic manuel)
     async function refreshModel() {
         GM_deleteValue('gemini_model_cache');
-        currentModel = null;
-        showMessage("🔄 Rafraîchissement du modèle...", 'info');
-        await detectBestModel();
-        showMessage(`✅ Modèle actuel: ${currentModel}`, 'success');
+        await detectBestModel(true);
         updateModelDisplay();
     }
 
     function updateModelDisplay() {
         const modelInfo = document.querySelector('.ai-model-info');
         if (modelInfo) {
-            modelInfo.textContent = `Modèle: ${currentModel || 'auto-detect'}`;
+            modelInfo.textContent = `Modèle: ${currentModel}`;
         }
     }
 
@@ -738,6 +724,9 @@ JSON uniquement:
     // INTERFACE
     // ============================================
     function initUI() {
+        // Charger le modèle depuis le cache (ZÉRO appel API)
+        loadModelFromCache();
+
         const style = document.createElement('style');
         style.textContent = `
             .ai-container {
@@ -937,7 +926,7 @@ JSON uniquement:
             <div class="ai-header">
                 <button class="ai-minimize">−</button>
                 <h2 class="ai-title">Remplissage Auto</h2>
-                <p class="ai-subtitle">IA + OCR Documents · V9.2.1 (Auto-Model)</p>
+                <p class="ai-subtitle">IA + OCR Documents · V9.2.3</p>
                 <div class="ai-status">
                     <span class="ai-status-dot"></span>
                     Connecté
@@ -990,7 +979,7 @@ JSON uniquement:
                     <button id="refresh-model" class="ai-btn-secondary">🔄 Modèle</button>
                     <button id="reset-key" class="ai-btn-secondary">🔑 Clé</button>
                 </div>
-                <p class="ai-model-info" title="Cliquez pour rafraîchir">Modèle: auto-detect</p>
+                <p class="ai-model-info" title="Cliquez pour actualiser">${currentModel}</p>
             </div>
         `;
         document.body.prepend(container);
@@ -1091,9 +1080,6 @@ JSON uniquement:
 
         // Clic sur le modèle pour rafraîchir
         document.querySelector('.ai-model-info').onclick = refreshModel;
-
-        // Détecter le modèle au démarrage
-        detectBestModel().then(updateModelDisplay);
     }
 
     window.addEventListener('load', initUI);
