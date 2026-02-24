@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Remplissage Automatique V10 - OCR Documents
 // @namespace    https://github.com/BiggerThanTheMall/tampermonkey-ltoa
-// @version      10.1.0
-// @description  Auto-remplissage Fiche client Modulr
+// @version      10.1.1
+// @description  Creation de fiche client automatique - API GEMINI
 // @author       Sheana
 // @match        https://courtage.modulr.fr/fr/scripts/clients/clients_manage.php*
 // @run-at       document-end
