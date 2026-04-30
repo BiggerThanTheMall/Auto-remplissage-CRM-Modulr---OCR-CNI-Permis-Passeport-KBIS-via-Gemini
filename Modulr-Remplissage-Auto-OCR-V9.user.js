@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Remplissage Automatique V10 - OCR Documents
 // @namespace    https://github.com/BiggerThanTheMall/tampermonkey-ltoa
-// @version      10.1.1
+// @version      10.2.0
 // @description  Creation de fiche client automatique - API GEMINI
 // @author       Sheana
 // @match        https://courtage.modulr.fr/fr/scripts/clients/clients_manage.php*
@@ -20,17 +20,15 @@
     // ============================================
     // CONFIGURATION
     // ============================================
-    const CONFIG = {
+const CONFIG = {
         API_ENDPOINT: 'https://generativelanguage.googleapis.com/v1beta/models/',
         MAX_TOKENS: 4096,
         TEMPERATURE: 0,
         MODEL_PRIORITY: [
-            'gemini-2.5-flash',
-            'gemini-2.0-flash',
-            'gemini-1.5-flash',
-            'gemini-flash'
+            'gemini-3-flash-preview',      //  modèle principal
+            'gemini-3.1-flash-lite-preview' // Modèle de secours 
         ],
-        DEFAULT_MODEL: 'gemini-2.0-flash',
+        DEFAULT_MODEL: 'gemini-3-flash-preview',
         // Cache du modèle (12 heures - refresh plus fréquent)
         MODEL_CACHE_DURATION: 12 * 60 * 60 * 1000,
         SUPPORTED_TYPES: {
